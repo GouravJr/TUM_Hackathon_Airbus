@@ -1,5 +1,12 @@
+from pathlib import Path
+
 from graph import MunichAirspaceDigitalTwin
 import networkx as nx
+
+
+BACKEND_DIR = Path(__file__).resolve().parent
+WORLD_JSON_PATH = BACKEND_DIR / "world.json"
+MAP_HTML_PATH = BACKEND_DIR / "munich_airspace_map.html"
 
 
 def print_section(title):
@@ -33,7 +40,7 @@ def safe_find_route(twin, start, destination, mission_type):
 
 
 def main():
-    print_section("BUILDING PHASE 1.6 MUNICH AIRSPACE DIGITAL TWIN")
+    print_section("BUILDING MUNICH AIRSPACE DIGITAL TWIN")
 
     twin = MunichAirspaceDigitalTwin()
     twin.build_world()
@@ -56,6 +63,7 @@ def main():
         print(
             f"{node_name} | "
             f"type={availability['type']} | "
+            f"category={availability['category']} | "
             f"capacity={availability['capacity']} | "
             f"load={availability['current_load']} | "
             f"available={availability['available_slots']} | "
@@ -76,7 +84,7 @@ def main():
             f"base_cost={route.base_total_cost}"
         )
 
-    print_section("MISSION-SPECIFIC ROUTING: PASSENGER ROUTE")
+    print_section("MISSION ROUTING: PASSENGER")
 
     passenger_start = "Munich Airport"
     passenger_destination = "Marienplatz"
@@ -89,43 +97,30 @@ def main():
     )
 
     if passenger_route:
-        print("\nPassenger route:")
         print_route_result(passenger_route)
 
-    print_section("MISSION-SPECIFIC ROUTING: MEDICAL AND ORGAN ROUTES")
+    print_section("MISSION ROUTING: MEDICAL EMERGENCY")
 
     emergency_start = "Munich Airport"
     emergency_destination = "TUM Klinikum Rechts der Isar"
 
-    medical_route = safe_find_route(
+    emergency_route = safe_find_route(
         twin=twin,
         start=emergency_start,
         destination=emergency_destination,
-        mission_type="medical",
+        mission_type="emergency",
     )
 
-    organ_route = safe_find_route(
-        twin=twin,
-        start=emergency_start,
-        destination=emergency_destination,
-        mission_type="organ",
-    )
-
-    if medical_route:
-        print("\nMedical route:")
-        print_route_result(medical_route)
-
-    if organ_route:
-        print("\nOrgan transport route:")
-        print_route_result(organ_route)
+    if emergency_route:
+        print_route_result(emergency_route)
 
     print_section("DYNAMIC WEATHER UPDATE EXAMPLE")
 
-    print("Adding storm penalty on TUM Garching Campus -> Marienplatz")
+    print("Adding storm penalty on Ismaning Transit Charging Hub -> Messe München")
 
     twin.update_weather_penalty(
-        "TUM Garching Campus",
-        "Marienplatz",
+        "Ismaning Transit Charging Hub",
+        "Messe München",
         weather_penalty=40,
     )
 
@@ -149,24 +144,24 @@ def main():
         "TUM Klinikum Rechts der Isar",
     )
 
-    medical_after_closure = safe_find_route(
+    emergency_after_closure = safe_find_route(
         twin=twin,
         start=emergency_start,
         destination=emergency_destination,
-        mission_type="medical",
+        mission_type="emergency",
     )
 
-    if medical_after_closure:
-        print("\nMedical route after corridor closure:")
-        print_route_result(medical_after_closure)
+    if emergency_after_closure:
+        print("\nEmergency route after corridor closure:")
+        print_route_result(emergency_after_closure)
 
     print_section("RESTRICTED CORRIDOR EXAMPLE")
 
-    print("Restricting Munich Airport -> Munich Central Station corridor")
+    print("Restricting Airport Charging Hub -> Ismaning Transit Charging Hub corridor")
 
     twin.restrict_corridor(
-        "Munich Airport",
-        "Munich Central Station (Hauptbahnhof)",
+        "Airport Charging Hub",
+        "Ismaning Transit Charging Hub",
     )
 
     passenger_after_restriction = safe_find_route(
@@ -176,20 +171,20 @@ def main():
         mission_type="passenger",
     )
 
-    medical_after_restriction = safe_find_route(
+    emergency_after_restriction = safe_find_route(
         twin=twin,
         start=emergency_start,
         destination=emergency_destination,
-        mission_type="medical",
+        mission_type="emergency",
     )
 
     if passenger_after_restriction:
         print("\nPassenger route after restricted corridor:")
         print_route_result(passenger_after_restriction)
 
-    if medical_after_restriction:
-        print("\nMedical route after restricted corridor:")
-        print_route_result(medical_after_restriction)
+    if emergency_after_restriction:
+        print("\nEmergency route after restricted corridor:")
+        print_route_result(emergency_after_restriction)
 
     print_section("NEAREST CHARGING HUB EXAMPLE")
 
@@ -204,14 +199,14 @@ def main():
     print_section("ROUTE CONGESTION UPDATE EXAMPLE")
 
     twin.update_route_congestion(
-        "Munich Airport",
-        "Munich Central Station (Hauptbahnhof)",
+        "Airport Charging Hub",
+        "Ismaning Transit Charging Hub",
         current_aircraft_count=10,
     )
 
     updated_route = twin.get_route(
-        "Munich Airport",
-        "Munich Central Station (Hauptbahnhof)",
+        "Airport Charging Hub",
+        "Ismaning Transit Charging Hub",
     )
 
     print(updated_route.to_dict())
@@ -241,29 +236,29 @@ def main():
 
     print_section("EXPORTING WORLD JSON")
 
-    twin.export_world_json()
-    print("world.json created at: backend/world.json")
+    twin.export_world_json(filename=WORLD_JSON_PATH)
+    print(f"world.json created at: {WORLD_JSON_PATH}")
 
     print_section("CREATING INTERACTIVE MAP")
 
     highlight_path = None
 
-    if medical_after_closure:
-        highlight_path = medical_after_closure["path"]
-    elif medical_route:
-        highlight_path = medical_route["path"]
+    if emergency_after_closure:
+        highlight_path = emergency_after_closure["path"]
+    elif emergency_route:
+        highlight_path = emergency_route["path"]
     elif passenger_after_weather:
         highlight_path = passenger_after_weather["path"]
     elif passenger_route:
         highlight_path = passenger_route["path"]
 
     map_file = twin.create_interactive_map(
-        filename="backend/munich_airspace_map.html",
+        filename=MAP_HTML_PATH,
         highlight_path=highlight_path,
     )
 
     print(f"Map created at: {map_file}")
-    print("Open backend/munich_airspace_map.html in your browser.")
+    print(f"Open this file in your browser: {MAP_HTML_PATH}")
 
     print_section("DONE")
 
