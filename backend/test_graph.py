@@ -2,9 +2,9 @@ from graph import MunichAirspaceDigitalTwin
 
 
 def print_section(title):
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print(title)
-    print("=" * 60)
+    print("=" * 70)
 
 
 def main():
@@ -21,26 +21,50 @@ def main():
     print(f"Hospitals: {stats['hospitals']}")
     print(f"Charging hubs: {stats['charging_hubs']}")
     print(f"Air corridors: {stats['total_routes']}")
+    print(f"Available nodes: {stats['available_nodes']}")
+    print(f"Busy nodes: {stats['busy_nodes']}")
+    print(f"Full nodes: {stats['full_nodes']}")
 
-    print_section("LOCATIONS")
+    print_section("PAD / NODE AVAILABILITY")
 
-    for node in twin.nodes.values():
+    for node_name, availability in twin.get_all_availability().items():
         print(
-            f"{node.id:02d}. {node.name} | "
-            f"type={node.node_type} | "
-            f"lat={node.lat}, lon={node.lon}"
+            f"{node_name} | "
+            f"type={availability['type']} | "
+            f"capacity={availability['capacity']} | "
+            f"current_load={availability['current_load']} | "
+            f"available_slots={availability['available_slots']} | "
+            f"status={availability['status']}"
         )
 
-    print_section("AIR CORRIDORS")
+    print_section("SAMPLE AVAILABILITY UPDATE")
+
+    target_pad = "TUM Main Campus"
+
+    before = twin.get_pad_availability(target_pad)
+    print(f"Before landing at {target_pad}: {before}")
+
+    success = twin.occupy_landing_slot(target_pad)
+    print(f"Landing slot occupied: {success}")
+
+    after = twin.get_pad_availability(target_pad)
+    print(f"After landing at {target_pad}: {after}")
+
+    print_section("AIR CORRIDORS WITH COSTS")
 
     for route in twin.routes:
         print(
             f"{route.start} <--> {route.end} | "
             f"type={route.route_type} | "
-            f"distance={route.distance} km"
+            f"distance={route.distance} km | "
+            f"battery={route.battery_cost} | "
+            f"noise={route.noise_penalty} | "
+            f"weather={route.weather_penalty} | "
+            f"traffic={route.traffic_penalty} | "
+            f"total_cost={route.total_cost}"
         )
 
-    print_section("SAMPLE SHORTEST PATHS")
+    print_section("SAMPLE LOWEST-COST PATHS")
 
     sample_queries = [
         ("Munich Airport", "TUM Klinikum Rechts der Isar"),
@@ -52,13 +76,14 @@ def main():
     highlighted_path = None
 
     for index, (start, end) in enumerate(sample_queries, start=1):
-        path, distance = twin.find_shortest_path(start, end)
+        path, distance_km, total_cost = twin.find_shortest_path(start, end)
 
         print(f"\nQuery {index}")
         print(f"From: {start}")
         print(f"To:   {end}")
         print(f"Path: {' -> '.join(path)}")
-        print(f"Total air distance: {distance} km")
+        print(f"Total air distance: {distance_km} km")
+        print(f"Total route cost: {total_cost}")
 
         if index == 1:
             highlighted_path = path
@@ -68,7 +93,7 @@ def main():
     twin.export_world_json()
     print("world.json created at: backend/world.json")
 
-    print_section("CREATING RICH INTERACTIVE MAP")
+    print_section("CREATING INTERACTIVE MAP")
 
     map_file = twin.create_interactive_map(
         filename="backend/munich_airspace_map.html",
