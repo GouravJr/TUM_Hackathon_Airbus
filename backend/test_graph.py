@@ -24,6 +24,7 @@ def main():
     print(f"Available nodes: {stats['available_nodes']}")
     print(f"Busy nodes: {stats['busy_nodes']}")
     print(f"Full nodes: {stats['full_nodes']}")
+    print(f"Total aircraft on routes: {stats['total_aircraft_on_routes']}")
 
     print_section("PAD / NODE AVAILABILITY")
 
@@ -50,7 +51,7 @@ def main():
     after = twin.get_pad_availability(target_pad)
     print(f"After landing at {target_pad}: {after}")
 
-    print_section("AIR CORRIDORS WITH COSTS")
+    print_section("AIR CORRIDORS WITH CONGESTION AND COSTS")
 
     for route in twin.routes:
         print(
@@ -60,9 +61,28 @@ def main():
             f"battery={route.battery_cost} | "
             f"noise={route.noise_penalty} | "
             f"weather={route.weather_penalty} | "
+            f"aircraft_count={route.current_aircraft_count} | "
             f"traffic={route.traffic_penalty} | "
             f"total_cost={route.total_cost}"
         )
+
+    print_section("SAMPLE ROUTE CONGESTION UPDATE")
+
+    route_start = "Munich Airport"
+    route_end = "Munich Central Station (Hauptbahnhof)"
+
+    before_route = twin.get_route(route_start, route_end).to_dict()
+    print("Before congestion update:")
+    print(before_route)
+
+    updated_route = twin.update_route_congestion(
+        route_start,
+        route_end,
+        current_aircraft_count=8,
+    )
+
+    print("\nAfter congestion update:")
+    print(updated_route)
 
     print_section("SAMPLE LOWEST-COST PATHS")
 
