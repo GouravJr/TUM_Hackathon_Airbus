@@ -1,6 +1,7 @@
 import json
 from math import radians, sin, cos, sqrt, atan2
 from pathlib import Path
+from datetime import datetime
 
 import folium
 import networkx as nx
@@ -11,12 +12,16 @@ from folium.plugins import Fullscreen, MiniMap, MeasureControl
 BATTERY_CONSUMPTION_RATE = 0.18
 TRAFFIC_PENALTY_PER_AIRCRAFT = 2.0
 
+MISSION_TYPES = {
+    "passenger",
+    "medical",
+    "organ",
+    "low_battery",
+    "repositioning",
+}
+
 
 def calculate_air_distance_km(lat1, lon1, lat2, lon2):
-    """
-    Calculate straight-line air distance between two latitude/longitude points.
-    Suitable for simplified eVTOL air corridors.
-    """
     earth_radius_km = 6371.0
 
     dlat = radians(lat2 - lat1)
@@ -56,7 +61,6 @@ class AirNode:
         self.lat = lat
         self.lon = lon
         self.description = description
-
         self.capacity = capacity
         self.current_load = current_load
         self.priority_level = priority_level
@@ -100,24 +104,26 @@ class AirRoute:
         self,
         start,
         end,
-        route_type="standard",
-        distance=None,
+        route_type="city_corridor",
         noise_penalty=0,
         weather_penalty=0,
         current_aircraft_count=0,
+        safety_status="open",
+        altitude_layer="standard",
     ):
         self.start = start
         self.end = end
         self.route_type = route_type
-        self.distance = distance
 
+        self.distance = None
+        self.battery_cost = None
         self.noise_penalty = noise_penalty
         self.weather_penalty = weather_penalty
         self.current_aircraft_count = current_aircraft_count
-
-        self.battery_cost = None
         self.traffic_penalty = None
-        self.total_cost = None
+        self.safety_status = safety_status
+        self.altitude_layer = altitude_layer
+        self.base_total_cost = None
 
     def recalculate_costs(self):
         if self.distance is None:
@@ -129,7 +135,7 @@ class AirRoute:
             2,
         )
 
-        self.total_cost = round(
+        self.base_total_cost = round(
             self.distance
             + self.battery_cost
             + self.noise_penalty
@@ -138,11 +144,74 @@ class AirRoute:
             2,
         )
 
+    def mission_cost(self, mission_type):
+        if mission_type not in MISSION_TYPES:
+            raise ValueError(f"Unknown mission type: {mission_type}")
+
+        if self.safety_status == "closed":
+            return float("inf")
+
+        if self.safety_status == "restricted" and mission_type not in {
+            "medical",
+            "organ",
+            "low_battery",
+        }:
+            return float("inf")
+
+        if self.altitude_layer == "emergency" and mission_type not in {
+            "medical",
+            "organ",
+            "low_battery",
+        }:
+            return float("inf")
+
+        if mission_type == "passenger":
+            cost = (
+                self.distance
+                + self.battery_cost
+                + self.noise_penalty
+                + self.weather_penalty
+                + self.traffic_penalty
+            )
+
+        elif mission_type == "medical":
+            cost = (
+                self.distance
+                + self.battery_cost
+                + self.weather_penalty
+                + 0.3 * self.traffic_penalty
+            )
+
+        elif mission_type == "organ":
+            cost = self.distance + self.weather_penalty
+
+        elif mission_type == "low_battery":
+            cost = (
+                self.distance
+                + self.weather_penalty
+                + self.traffic_penalty
+            )
+
+        elif mission_type == "repositioning":
+            cost = (
+                self.distance
+                + self.battery_cost
+                + self.noise_penalty
+                + self.traffic_penalty
+            )
+
+        else:
+            cost = self.base_total_cost
+
+        return round(cost, 2)
+
     def to_dict(self):
         return {
             "start": self.start,
             "end": self.end,
             "route_type": self.route_type,
+            "altitude_layer": self.altitude_layer,
+            "safety_status": self.safety_status,
             "distance_km": self.distance,
             "battery_consumption_rate": BATTERY_CONSUMPTION_RATE,
             "battery_cost": self.battery_cost,
@@ -151,15 +220,15 @@ class AirRoute:
             "current_aircraft_count": self.current_aircraft_count,
             "traffic_penalty_per_aircraft": TRAFFIC_PENALTY_PER_AIRCRAFT,
             "traffic_penalty": self.traffic_penalty,
-            "total_cost": self.total_cost,
+            "base_total_cost": self.base_total_cost,
+            "mission_costs": {
+                mission_type: self.mission_cost(mission_type)
+                for mission_type in MISSION_TYPES
+            },
         }
 
 
 class RestrictMapBounds(MacroElement):
-    """
-    Restricts map panning to the Munich + Airport operating region.
-    """
-
     def __init__(self, bounds):
         super().__init__()
         self._name = "RestrictMapBounds"
@@ -184,6 +253,16 @@ class MunichAirspaceDigitalTwin:
         self.nodes = {}
         self.routes = []
         self.graph = nx.Graph()
+        self.event_log = []
+
+    def log_event(self, event_type, message):
+        event = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "event_type": event_type,
+            "message": message,
+        }
+        self.event_log.append(event)
+        return event
 
     def add_node(self, air_node):
         self.nodes[air_node.name] = air_node
@@ -207,7 +286,6 @@ class MunichAirspaceDigitalTwin:
 
     def sync_node_to_graph(self, node_name):
         node = self.nodes[node_name]
-
         self.graph.nodes[node_name]["current_load"] = node.current_load
         self.graph.nodes[node_name]["available_slots"] = node.available_slots
         self.graph.nodes[node_name]["availability_status"] = node.availability_status
@@ -222,34 +300,33 @@ class MunichAirspaceDigitalTwin:
         start_node = self.nodes[air_route.start]
         end_node = self.nodes[air_route.end]
 
-        distance = calculate_air_distance_km(
+        air_route.distance = calculate_air_distance_km(
             start_node.lat,
             start_node.lon,
             end_node.lat,
             end_node.lon,
         )
 
-        air_route.distance = distance
         air_route.recalculate_costs()
 
         self.routes.append(air_route)
         self.sync_route_to_graph(air_route)
 
-    def sync_route_to_graph(self, air_route):
+    def sync_route_to_graph(self, route):
         self.graph.add_edge(
-            air_route.start,
-            air_route.end,
-            weight=air_route.total_cost,
-            distance_km=air_route.distance,
-            battery_consumption_rate=BATTERY_CONSUMPTION_RATE,
-            battery_cost=air_route.battery_cost,
-            noise_penalty=air_route.noise_penalty,
-            weather_penalty=air_route.weather_penalty,
-            current_aircraft_count=air_route.current_aircraft_count,
-            traffic_penalty_per_aircraft=TRAFFIC_PENALTY_PER_AIRCRAFT,
-            traffic_penalty=air_route.traffic_penalty,
-            total_cost=air_route.total_cost,
-            route_type=air_route.route_type,
+            route.start,
+            route.end,
+            weight=route.base_total_cost,
+            route_type=route.route_type,
+            altitude_layer=route.altitude_layer,
+            safety_status=route.safety_status,
+            distance_km=route.distance,
+            battery_cost=route.battery_cost,
+            noise_penalty=route.noise_penalty,
+            weather_penalty=route.weather_penalty,
+            current_aircraft_count=route.current_aircraft_count,
+            traffic_penalty=route.traffic_penalty,
+            base_total_cost=route.base_total_cost,
         )
 
     def get_route(self, start, end):
@@ -258,15 +335,9 @@ class MunichAirspaceDigitalTwin:
                 route.start == end and route.end == start
             ):
                 return route
-
         raise ValueError(f"Route does not exist: {start} <-> {end}")
 
     def update_route_congestion(self, start, end, current_aircraft_count):
-        """
-        Update congestion on a route.
-        traffic_penalty is automatically recalculated as:
-        current_aircraft_count * TRAFFIC_PENALTY_PER_AIRCRAFT
-        """
         if current_aircraft_count < 0:
             raise ValueError("current_aircraft_count cannot be negative.")
 
@@ -275,17 +346,69 @@ class MunichAirspaceDigitalTwin:
         route.recalculate_costs()
         self.sync_route_to_graph(route)
 
+        self.log_event(
+            "ROUTE_CONGESTION_UPDATE",
+            f"{start} ↔ {end} now has {current_aircraft_count} aircraft. Traffic penalty = {route.traffic_penalty}.",
+        )
+
         return route.to_dict()
 
     def increase_route_congestion(self, start, end, amount=1):
         route = self.get_route(start, end)
-        new_count = route.current_aircraft_count + amount
-        return self.update_route_congestion(start, end, new_count)
+        return self.update_route_congestion(
+            start,
+            end,
+            route.current_aircraft_count + amount,
+        )
 
     def decrease_route_congestion(self, start, end, amount=1):
         route = self.get_route(start, end)
-        new_count = max(route.current_aircraft_count - amount, 0)
-        return self.update_route_congestion(start, end, new_count)
+        return self.update_route_congestion(
+            start,
+            end,
+            max(route.current_aircraft_count - amount, 0),
+        )
+
+    def update_weather_penalty(self, start, end, weather_penalty):
+        if weather_penalty < 0:
+            raise ValueError("weather_penalty cannot be negative.")
+
+        route = self.get_route(start, end)
+        route.weather_penalty = weather_penalty
+        route.recalculate_costs()
+        self.sync_route_to_graph(route)
+
+        self.log_event(
+            "WEATHER_UPDATE",
+            f"{start} ↔ {end} weather penalty updated to {weather_penalty}.",
+        )
+
+        return route.to_dict()
+
+    def update_corridor_status(self, start, end, safety_status):
+        if safety_status not in {"open", "restricted", "closed"}:
+            raise ValueError("safety_status must be open, restricted, or closed.")
+
+        route = self.get_route(start, end)
+        route.safety_status = safety_status
+        route.recalculate_costs()
+        self.sync_route_to_graph(route)
+
+        self.log_event(
+            "CORRIDOR_STATUS_UPDATE",
+            f"{start} ↔ {end} status changed to {safety_status}.",
+        )
+
+        return route.to_dict()
+
+    def close_corridor(self, start, end):
+        return self.update_corridor_status(start, end, "closed")
+
+    def restrict_corridor(self, start, end):
+        return self.update_corridor_status(start, end, "restricted")
+
+    def reopen_corridor(self, start, end):
+        return self.update_corridor_status(start, end, "open")
 
     def get_pad_availability(self, node_name):
         if node_name not in self.nodes:
@@ -313,10 +436,20 @@ class MunichAirspaceDigitalTwin:
         node = self.nodes[node_name]
 
         if node.current_load >= node.capacity:
+            self.log_event(
+                "LANDING_DENIED",
+                f"{node_name} is full. Landing slot unavailable.",
+            )
             return False
 
         node.current_load += 1
         self.sync_node_to_graph(node_name)
+
+        self.log_event(
+            "LANDING_SLOT_OCCUPIED",
+            f"{node_name}: {node.current_load}/{node.capacity} slots occupied.",
+        )
+
         return True
 
     def release_landing_slot(self, node_name):
@@ -329,6 +462,12 @@ class MunichAirspaceDigitalTwin:
             node.current_load -= 1
 
         self.sync_node_to_graph(node_name)
+
+        self.log_event(
+            "LANDING_SLOT_RELEASED",
+            f"{node_name}: {node.current_load}/{node.capacity} slots occupied.",
+        )
+
         return True
 
     def get_all_availability(self):
@@ -337,376 +476,246 @@ class MunichAirspaceDigitalTwin:
             for node_name in self.nodes
         }
 
-    def build_world(self):
-        node_data = [
-            (
-                1,
-                "Munich Airport",
-                "pad",
-                48.3538,
-                11.7861,
-                "Major airport pad and northern entry point for eVTOL traffic.",
-                8,
-                8,
-                "airport",
-                100,
-                "north",
-                3,
-            ),
-            (
-                2,
-                "Munich Central Station (Hauptbahnhof)",
-                "pad",
-                48.1402,
-                11.5584,
-                "High passenger-transfer pad near the main railway station.",
-                6,
-                8,
-                "commercial",
-                95,
-                "central",
-                4,
-            ),
-            (
-                3,
-                "Marienplatz",
-                "pad",
-                48.1374,
-                11.5755,
-                "Central Munich pad with high passenger demand.",
-                5,
-                9,
-                "commercial",
-                90,
-                "central",
-                5,
-            ),
-            (
-                4,
-                "TUM Main Campus",
-                "pad",
-                48.1486,
-                11.5682,
-                "University and technology district pad.",
-                4,
-                7,
-                "educational",
-                85,
-                "central",
-                1,
-            ),
-            (
-                5,
-                "LMU Munich",
-                "pad",
-                48.1508,
-                11.5806,
-                "University district pad near Maxvorstadt.",
-                4,
-                7,
-                "educational",
-                80,
-                "central",
-                2,
-            ),
-            (
-                6,
-                "Allianz Arena",
-                "pad",
-                48.2188,
-                11.6247,
-                "Event-based northern mobility pad.",
-                4,
-                6,
-                "event",
-                70,
-                "north",
-                1,
-            ),
-            (
-                7,
-                "Messe München",
-                "pad",
-                48.1356,
-                11.6903,
-                "Trade fair and business mobility pad.",
-                5,
-                7,
-                "commercial",
-                75,
-                "east",
-                2,
-            ),
-            (
-                8,
-                "Olympiapark",
-                "pad",
-                48.1739,
-                11.5461,
-                "Event and leisure mobility pad.",
-                4,
-                6,
-                "event",
-                70,
-                "northwest",
-                2,
-            ),
-            (
-                9,
-                "Schwabing",
-                "pad",
-                48.1665,
-                11.5860,
-                "Dense residential and business district pad.",
-                3,
-                6,
-                "residential",
-                75,
-                "central",
-                2,
-            ),
-            (
-                10,
-                "Sendlinger Tor",
-                "pad",
-                48.1330,
-                11.5668,
-                "Inner-city transfer pad.",
-                4,
-                7,
-                "commercial",
-                80,
-                "central",
-                2,
-            ),
-            (
-                11,
-                "TUM Klinikum Rechts der Isar",
-                "hospital",
-                48.1355,
-                11.5991,
-                "Central medical landing point near Rechts der Isar.",
-                4,
-                10,
-                "medical",
-                70,
-                "central",
-                1,
-            ),
-            (
-                12,
-                "Großhadern Clinic",
-                "hospital",
-                48.1113,
-                11.4697,
-                "Large hospital zone in southwest Munich.",
-                5,
-                10,
-                "medical",
-                75,
-                "west",
-                2,
-            ),
-            (
-                13,
-                "München Klinik Schwabing",
-                "hospital",
-                48.1678,
-                11.5826,
-                "Hospital landing point in Schwabing.",
-                3,
-                10,
-                "medical",
-                65,
-                "central",
-                2,
-            ),
-            (
-                14,
-                "Munich Clinic Bogenhausen",
-                "hospital",
-                48.1525,
-                11.6215,
-                "Hospital landing point in eastern Munich.",
-                3,
-                10,
-                "medical",
-                65,
-                "east",
-                1,
-            ),
-            (
-                15,
-                "München Klinik Neuperlach",
-                "hospital",
-                48.1039,
-                11.6460,
-                "Southeast medical landing point.",
-                3,
-                10,
-                "medical",
-                60,
-                "southeast",
-                0,
-            ),
-            (
-                16,
-                "Harlaching Hospital",
-                "hospital",
-                48.1027,
-                11.5798,
-                "Southern medical landing point.",
-                3,
-                10,
-                "medical",
-                60,
-                "south",
-                1,
-            ),
-            (
-                17,
-                "Charging Hub A - Airport",
-                "charging_hub",
-                48.3600,
-                11.7800,
-                "Airport charging hub for recharging between airport missions.",
-                8,
-                6,
-                "airport",
-                85,
-                "north",
-                4,
-            ),
-            (
-                18,
-                "Charging Hub B - TUM Tech Area",
-                "charging_hub",
-                48.1525,
-                11.5740,
-                "Technology-district charging hub near TUM and LMU.",
-                5,
-                6,
-                "educational",
-                80,
-                "central",
-                2,
-            ),
-            (
-                19,
-                "Charging Hub C - City Center",
-                "charging_hub",
-                48.1390,
-                11.5810,
-                "City-center charging hub near Marienplatz for high passenger turnover.",
-                5,
-                6,
-                "commercial",
-                85,
-                "central",
-                4,
-            ),
-            (
-                20,
-                "Charging Hub D - Großhadern Zone",
-                "charging_hub",
-                48.1090,
-                11.4750,
-                "Southwest charging hub supporting Großhadern emergency logistics.",
-                5,
-                6,
-                "medical",
-                70,
-                "west",
-                1,
-            ),
-            (
-                21,
-                "Charging Hub E - East Munich",
-                "charging_hub",
-                48.1350,
-                11.6700,
-                "Eastern charging hub supporting Messe München and Bogenhausen corridors.",
-                5,
-                6,
-                "commercial",
-                75,
-                "east",
-                3,
-            ),
-        ]
+    def route_allowed_for_mission(self, route, mission_type):
+        if route.safety_status == "closed":
+            return False
 
-        for (
-            node_id,
-            name,
-            node_type,
-            lat,
-            lon,
-            description,
-            capacity,
-            priority_level,
-            zone_type,
-            demand_score,
-            weather_zone,
-            current_load,
-        ) in node_data:
-            self.add_node(
-                AirNode(
-                    node_id=node_id,
-                    name=name,
-                    node_type=node_type,
-                    lat=lat,
-                    lon=lon,
-                    description=description,
-                    capacity=capacity,
-                    priority_level=priority_level,
-                    zone_type=zone_type,
-                    demand_score=demand_score,
-                    weather_zone=weather_zone,
-                    current_load=current_load,
-                )
+        if route.safety_status == "restricted" and mission_type not in {
+            "medical",
+            "organ",
+            "low_battery",
+        }:
+            return False
+
+        if route.altitude_layer == "emergency" and mission_type not in {
+            "medical",
+            "organ",
+            "low_battery",
+        }:
+            return False
+
+        return True
+
+    def build_mission_graph(self, mission_type):
+        mission_graph = nx.Graph()
+
+        for node_name, node in self.nodes.items():
+            mission_graph.add_node(
+                node_name,
+                lat=node.lat,
+                lon=node.lon,
+                type=node.node_type,
             )
 
-        route_pairs = [
-            # start, end, route_type, noise_penalty, weather_penalty, current_aircraft_count
+        for route in self.routes:
+            if not self.route_allowed_for_mission(route, mission_type):
+                continue
 
-            ("Munich Airport", "Charging Hub A - Airport", "charging_corridor", 0, 0, 1),
-            ("Munich Airport", "Allianz Arena", "airport_corridor", 1, 0, 3),
-            ("Munich Airport", "Munich Central Station (Hauptbahnhof)", "airport_corridor", 4, 0, 5),
-            ("Munich Airport", "Messe München", "airport_corridor", 2, 0, 4),
+            mission_graph.add_edge(
+                route.start,
+                route.end,
+                weight=route.mission_cost(mission_type),
+                distance_km=route.distance,
+            )
 
-            ("Allianz Arena", "Schwabing", "city_corridor", 7, 0, 2),
-            ("Allianz Arena", "Olympiapark", "city_corridor", 4, 0, 2),
-            ("Olympiapark", "Munich Central Station (Hauptbahnhof)", "city_corridor", 6, 0, 3),
-            ("Olympiapark", "LMU Munich", "city_corridor", 7, 0, 2),
+        return mission_graph
 
-            ("Schwabing", "LMU Munich", "city_corridor", 8, 0, 3),
-            ("Schwabing", "München Klinik Schwabing", "medical_corridor", 8, 0, 1),
-            ("Schwabing", "Munich Clinic Bogenhausen", "medical_corridor", 6, 0, 2),
-            ("LMU Munich", "TUM Main Campus", "city_corridor", 7, 0, 2),
-            ("LMU Munich", "Marienplatz", "city_corridor", 6, 0, 3),
-            ("TUM Main Campus", "Marienplatz", "city_corridor", 5, 0, 4),
-            ("TUM Main Campus", "TUM Klinikum Rechts der Isar", "medical_corridor", 4, 0, 1),
-            ("TUM Main Campus", "Charging Hub B - TUM Tech Area", "charging_corridor", 3, 0, 1),
+    def find_best_route(self, start, destination, mission_type="passenger"):
+        if mission_type not in MISSION_TYPES:
+            raise ValueError(f"Unknown mission type: {mission_type}")
 
-            ("Marienplatz", "Munich Central Station (Hauptbahnhof)", "city_corridor", 7, 0, 5),
-            ("Marienplatz", "Sendlinger Tor", "city_corridor", 7, 0, 4),
-            ("Marienplatz", "Charging Hub C - City Center", "charging_corridor", 6, 0, 2),
-            ("Marienplatz", "TUM Klinikum Rechts der Isar", "medical_corridor", 5, 0, 2),
-            ("Marienplatz", "Messe München", "city_corridor", 3, 0, 3),
+        if start not in self.nodes:
+            raise ValueError(f"Start node does not exist: {start}")
 
-            ("Messe München", "Munich Clinic Bogenhausen", "medical_corridor", 3, 0, 1),
-            ("Messe München", "München Klinik Neuperlach", "medical_corridor", 4, 0, 1),
-            ("Munich Clinic Bogenhausen", "TUM Klinikum Rechts der Isar", "medical_corridor", 5, 0, 2),
-            ("Charging Hub E - East Munich", "Messe München", "charging_corridor", 2, 0, 1),
-            ("Charging Hub E - East Munich", "Munich Clinic Bogenhausen", "charging_corridor", 3, 0, 1),
-            ("Charging Hub E - East Munich", "München Klinik Neuperlach", "charging_corridor", 3, 0, 1),
+        if destination not in self.nodes:
+            raise ValueError(f"Destination node does not exist: {destination}")
 
-            ("Sendlinger Tor", "Harlaching Hospital", "medical_corridor", 5, 0, 1),
-            ("Sendlinger Tor", "Großhadern Clinic", "medical_corridor", 5, 0, 2),
-            ("Sendlinger Tor", "Munich Central Station (Hauptbahnhof)", "city_corridor", 7, 0, 4),
-            ("Großhadern Clinic", "Charging Hub D - Großhadern Zone", "charging_corridor", 2, 0, 1),
-            ("Großhadern Clinic", "Harlaching Hospital", "medical_corridor", 4, 0, 1),
-            ("Harlaching Hospital", "München Klinik Neuperlach", "medical_corridor", 4, 0, 1),
+        mission_graph = self.build_mission_graph(mission_type)
+
+        path = nx.shortest_path(
+            mission_graph,
+            source=start,
+            target=destination,
+            weight="weight",
+        )
+
+        total_cost = nx.shortest_path_length(
+            mission_graph,
+            source=start,
+            target=destination,
+            weight="weight",
+        )
+
+        distance_km = 0
+
+        for source, target in zip(path[:-1], path[1:]):
+            route = self.get_route(source, target)
+            distance_km += route.distance
+
+        result = {
+            "mission_type": mission_type,
+            "start": start,
+            "destination": destination,
+            "path": path,
+            "distance_km": round(distance_km, 2),
+            "total_cost": round(total_cost, 2),
+        }
+
+        self.log_event(
+            "ROUTE_SELECTED",
+            f"{mission_type} route selected: {' → '.join(path)} | cost={round(total_cost, 2)}",
+        )
+
+        return result
+
+    def find_nearest_node_by_type(self, start, node_type, mission_type="low_battery"):
+        candidates = [
+            node.name
+            for node in self.nodes.values()
+            if node.node_type == node_type and node.available_slots > 0
+        ]
+
+        if not candidates:
+            raise ValueError(f"No available nodes found for type: {node_type}")
+
+        best_result = None
+
+        for candidate in candidates:
+            try:
+                result = self.find_best_route(start, candidate, mission_type)
+            except nx.NetworkXNoPath:
+                continue
+
+            if best_result is None or result["total_cost"] < best_result["total_cost"]:
+                best_result = result
+
+        if best_result is None:
+            raise ValueError(f"No reachable available node found for type: {node_type}")
+
+        return best_result
+
+    def find_nearest_charging_hub(self, start):
+        return self.find_nearest_node_by_type(
+            start=start,
+            node_type="charging_hub",
+            mission_type="low_battery",
+        )
+
+    def find_nearest_hospital(self, start):
+        return self.find_nearest_node_by_type(
+            start=start,
+            node_type="hospital",
+            mission_type="medical",
+        )
+
+    def build_world(self):
+        node_data = [
+            # Passenger / high-demand nodes
+            (1, "Munich Airport", "pad", 48.3538, 11.7861, "Airport transport hub.", 10, 9, "airport", 100, "north", 3),
+            (2, "Munich Central Station (Hauptbahnhof)", "pad", 48.1402, 11.5584, "Main rail hub.", 8, 8, "transport", 95, "central", 4),
+            (3, "Ostbahnhof", "pad", 48.1272, 11.6046, "Eastern rail hub.", 6, 7, "transport", 80, "east", 2),
+            (4, "Pasing Bahnhof", "pad", 48.1498, 11.4617, "Western rail hub.", 6, 7, "transport", 75, "west", 2),
+            (5, "Marienplatz", "pad", 48.1374, 11.5755, "City center demand node.", 5, 9, "commercial", 90, "central", 5),
+            (6, "Sendlinger Tor", "pad", 48.1330, 11.5668, "Inner-city transfer node.", 5, 7, "commercial", 80, "central", 2),
+            (7, "Schwabing", "pad", 48.1665, 11.5860, "Residential and business zone.", 4, 6, "residential", 75, "central", 2),
+            (8, "Arabellapark", "pad", 48.1527, 11.6189, "Business district node.", 4, 6, "business", 70, "east", 1),
+            (9, "Messe München", "pad", 48.1356, 11.6903, "Trade fair and conference node.", 7, 7, "commercial", 85, "east", 2),
+            (10, "Neuperlach", "pad", 48.1000, 11.6450, "Southeast demand zone.", 4, 6, "residential", 65, "southeast", 1),
+            (11, "TUM Main Campus", "pad", 48.1486, 11.5682, "University and technology node.", 5, 7, "educational", 85, "central", 1),
+            (12, "LMU Munich", "pad", 48.1508, 11.5806, "University district node.", 5, 7, "educational", 80, "central", 2),
+            (13, "TUM Garching Campus", "pad", 48.2623, 11.6671, "Research campus and north transit node.", 6, 7, "educational", 80, "north", 2),
+            (14, "Allianz Arena", "pad", 48.2188, 11.6247, "Event node.", 6, 6, "event", 75, "north", 1),
+            (15, "Olympiapark", "pad", 48.1739, 11.5461, "Event and tourism node.", 5, 6, "event", 70, "northwest", 2),
+            (16, "BMW Welt", "pad", 48.1768, 11.5567, "Tourism and business node.", 4, 6, "tourism", 70, "northwest", 1),
+            (17, "Bogenhausen", "pad", 48.1540, 11.6250, "Residential demand zone.", 4, 6, "residential", 65, "east", 1),
+            (18, "Riem", "pad", 48.1370, 11.6860, "East Munich demand zone.", 4, 6, "residential", 60, "east", 1),
+            (19, "Harlaching", "pad", 48.0960, 11.5700, "South Munich demand zone.", 4, 6, "residential", 60, "south", 1),
+            (20, "Maxvorstadt", "pad", 48.1510, 11.5680, "Central university/residential zone.", 4, 7, "residential", 80, "central", 2),
+
+            # Hospitals
+            (21, "TUM Klinikum Rechts der Isar", "hospital", 48.1355, 11.5991, "Central emergency hospital.", 4, 10, "medical", 70, "central", 1),
+            (22, "Klinikum der Universität München Großhadern", "hospital", 48.1113, 11.4697, "Southwest major hospital.", 5, 10, "medical", 75, "west", 2),
+            (23, "München Klinik Schwabing", "hospital", 48.1678, 11.5826, "North-central hospital.", 3, 10, "medical", 65, "central", 2),
+            (24, "München Klinik Bogenhausen", "hospital", 48.1525, 11.6215, "East Munich hospital.", 3, 10, "medical", 65, "east", 1),
+            (25, "München Klinik Neuperlach", "hospital", 48.1039, 11.6460, "Southeast hospital.", 3, 10, "medical", 60, "southeast", 0),
+            (26, "TUM Klinikum Deutsches Herzzentrum", "hospital", 48.1585, 11.5696, "Specialist cardiac emergency hospital.", 3, 10, "medical", 70, "central", 1),
+
+            # Charging hubs
+            (27, "Airport Charging Hub", "charging_hub", 48.3600, 11.7800, "Airport charging hub.", 8, 6, "airport", 85, "north", 4),
+            (28, "Central Charging Hub", "charging_hub", 48.1390, 11.5810, "Central charging hub near Marienplatz.", 6, 6, "commercial", 85, "central", 3),
+            (29, "Ismaning Transit Charging Hub", "charging_hub", 48.2260, 11.6750, "North transit charging hub supporting Airport-City, Garching, Allianz Arena, and Messe corridors.", 6, 7, "transit", 85, "north", 2),
+            (30, "East Munich Charging Hub", "charging_hub", 48.1350, 11.6700, "East Munich charging hub.", 5, 6, "commercial", 75, "east", 3),
+            (31, "Großhadern Charging Hub", "charging_hub", 48.1090, 11.4750, "Southwest medical charging hub.", 5, 6, "medical", 70, "west", 1),
+        ]
+
+        for data in node_data:
+            self.add_node(AirNode(*data))
+
+        route_data = [
+            # start, end, route_type, noise, weather, aircraft_count, safety_status, altitude_layer
+
+            # Transit / airport
+            ("Munich Airport", "Airport Charging Hub", "charging_corridor", 0, 0, 2, "open", "transit"),
+            ("Munich Airport", "TUM Garching Campus", "airport_corridor", 1, 0, 4, "open", "transit"),
+            ("Munich Airport", "Allianz Arena", "airport_corridor", 1, 0, 3, "open", "transit"),
+            ("Munich Airport", "Messe München", "airport_corridor", 2, 0, 4, "open", "transit"),
+            ("Munich Airport", "Munich Central Station (Hauptbahnhof)", "airport_corridor", 4, 0, 5, "open", "transit"),
+
+            # Ismaning transit charging hub
+            ("Munich Airport", "Ismaning Transit Charging Hub", "charging_corridor", 1, 0, 3, "open", "transit"),
+            ("Ismaning Transit Charging Hub", "TUM Garching Campus", "charging_corridor", 2, 0, 2, "open", "transit"),
+            ("Ismaning Transit Charging Hub", "Allianz Arena", "charging_corridor", 2, 0, 2, "open", "transit"),
+            ("Ismaning Transit Charging Hub", "Schwabing", "charging_corridor", 4, 0, 2, "open", "standard"),
+            ("Ismaning Transit Charging Hub", "Messe München", "charging_corridor", 3, 0, 2, "open", "transit"),
+
+            # North / Garching / events
+            ("TUM Garching Campus", "Allianz Arena", "city_corridor", 2, 0, 2, "open", "transit"),
+            ("TUM Garching Campus", "Schwabing", "city_corridor", 5, 0, 3, "open", "standard"),
+            ("TUM Garching Campus", "Marienplatz", "city_corridor", 6, 0, 3, "open", "standard"),
+            ("Allianz Arena", "Olympiapark", "city_corridor", 4, 0, 2, "open", "standard"),
+            ("Olympiapark", "BMW Welt", "city_corridor", 3, 0, 2, "open", "standard"),
+            ("BMW Welt", "Schwabing", "city_corridor", 5, 0, 2, "open", "standard"),
+
+            # Central
+            ("Schwabing", "LMU Munich", "city_corridor", 8, 0, 3, "open", "standard"),
+            ("Schwabing", "München Klinik Schwabing", "medical_corridor", 6, 0, 1, "open", "emergency"),
+            ("LMU Munich", "TUM Main Campus", "city_corridor", 6, 0, 2, "open", "standard"),
+            ("LMU Munich", "Maxvorstadt", "city_corridor", 7, 0, 2, "open", "standard"),
+            ("Maxvorstadt", "TUM Main Campus", "city_corridor", 6, 0, 2, "open", "standard"),
+            ("TUM Main Campus", "Marienplatz", "city_corridor", 5, 0, 4, "open", "standard"),
+            ("Marienplatz", "Central Charging Hub", "charging_corridor", 6, 0, 3, "open", "standard"),
+            ("Marienplatz", "Sendlinger Tor", "city_corridor", 7, 0, 4, "open", "standard"),
+            ("Marienplatz", "Munich Central Station (Hauptbahnhof)", "city_corridor", 7, 0, 5, "open", "standard"),
+            ("Sendlinger Tor", "Munich Central Station (Hauptbahnhof)", "city_corridor", 7, 0, 4, "open", "standard"),
+
+            # East
+            ("Marienplatz", "Ostbahnhof", "city_corridor", 6, 0, 4, "open", "standard"),
+            ("Ostbahnhof", "Messe München", "city_corridor", 4, 0, 3, "open", "standard"),
+            ("Messe München", "Riem", "city_corridor", 3, 0, 2, "open", "standard"),
+            ("Riem", "East Munich Charging Hub", "charging_corridor", 2, 0, 2, "open", "standard"),
+            ("Messe München", "East Munich Charging Hub", "charging_corridor", 2, 0, 2, "open", "standard"),
+            ("Ostbahnhof", "Arabellapark", "city_corridor", 4, 0, 2, "open", "standard"),
+            ("Arabellapark", "Bogenhausen", "city_corridor", 5, 0, 2, "open", "standard"),
+            ("Bogenhausen", "München Klinik Bogenhausen", "medical_corridor", 4, 0, 1, "open", "emergency"),
+            ("Messe München", "München Klinik Neuperlach", "medical_corridor", 4, 0, 1, "open", "emergency"),
+            ("Neuperlach", "München Klinik Neuperlach", "medical_corridor", 3, 0, 1, "open", "emergency"),
+            ("Neuperlach", "East Munich Charging Hub", "charging_corridor", 2, 0, 1, "open", "standard"),
+
+            # West / south
+            ("Munich Central Station (Hauptbahnhof)", "Pasing Bahnhof", "city_corridor", 5, 0, 3, "open", "standard"),
+            ("Pasing Bahnhof", "Klinikum der Universität München Großhadern", "medical_corridor", 4, 0, 1, "open", "emergency"),
+            ("Klinikum der Universität München Großhadern", "Großhadern Charging Hub", "charging_corridor", 2, 0, 1, "open", "emergency"),
+            ("Sendlinger Tor", "Klinikum der Universität München Großhadern", "medical_corridor", 5, 0, 2, "open", "emergency"),
+            ("Sendlinger Tor", "Harlaching", "city_corridor", 5, 0, 2, "open", "standard"),
+            ("Harlaching", "München Klinik Neuperlach", "medical_corridor", 4, 0, 1, "open", "emergency"),
+            ("Harlaching", "TUM Klinikum Rechts der Isar", "medical_corridor", 4, 0, 1, "open", "emergency"),
+
+            # Central hospitals
+            ("Marienplatz", "TUM Klinikum Rechts der Isar", "medical_corridor", 5, 0, 2, "open", "emergency"),
+            ("TUM Main Campus", "TUM Klinikum Rechts der Isar", "medical_corridor", 4, 0, 1, "open", "emergency"),
+            ("TUM Main Campus", "TUM Klinikum Deutsches Herzzentrum", "medical_corridor", 4, 0, 1, "open", "emergency"),
+            ("Maxvorstadt", "TUM Klinikum Deutsches Herzzentrum", "medical_corridor", 5, 0, 1, "open", "emergency"),
+            ("München Klinik Bogenhausen", "TUM Klinikum Rechts der Isar", "medical_corridor", 5, 0, 1, "open", "emergency"),
         ]
 
         for (
@@ -716,7 +725,9 @@ class MunichAirspaceDigitalTwin:
             noise_penalty,
             weather_penalty,
             current_aircraft_count,
-        ) in route_pairs:
+            safety_status,
+            altitude_layer,
+        ) in route_data:
             self.add_route(
                 AirRoute(
                     start=start,
@@ -725,49 +736,27 @@ class MunichAirspaceDigitalTwin:
                     noise_penalty=noise_penalty,
                     weather_penalty=weather_penalty,
                     current_aircraft_count=current_aircraft_count,
+                    safety_status=safety_status,
+                    altitude_layer=altitude_layer,
                 )
             )
 
-    def find_shortest_path(self, start, end):
-        if start not in self.nodes:
-            raise ValueError(f"Start location does not exist: {start}")
-
-        if end not in self.nodes:
-            raise ValueError(f"Destination location does not exist: {end}")
-
-        path = nx.shortest_path(
-            self.graph,
-            source=start,
-            target=end,
-            weight="weight",
+        self.log_event(
+            "WORLD_BUILT",
+            f"Munich digital twin created with {len(self.nodes)} nodes and {len(self.routes)} corridors.",
         )
-
-        total_cost = nx.shortest_path_length(
-            self.graph,
-            source=start,
-            target=end,
-            weight="weight",
-        )
-
-        distance_km = 0
-
-        for source, target in zip(path[:-1], path[1:]):
-            distance_km += self.graph[source][target]["distance_km"]
-
-        return path, round(distance_km, 2), round(total_cost, 2)
 
     def export_world_json(self, filename="backend/world.json"):
         world = {
             "simulation_parameters": {
                 "battery_consumption_rate": BATTERY_CONSUMPTION_RATE,
                 "traffic_penalty_per_aircraft": TRAFFIC_PENALTY_PER_AIRCRAFT,
-                "cost_formula": (
-                    "total_cost = distance_km + battery_cost + noise_penalty "
-                    "+ weather_penalty + traffic_penalty"
-                ),
+                "mission_types": sorted(list(MISSION_TYPES)),
+                "cost_formula": "Dynamic mission-specific edge costs over fixed air corridors.",
             },
             "nodes": [node.to_dict() for node in self.nodes.values()],
             "edges": [route.to_dict() for route in self.routes],
+            "event_log": self.event_log,
         }
 
         output_path = Path(filename)
@@ -779,16 +768,13 @@ class MunichAirspaceDigitalTwin:
         return world
 
     def get_network_stats(self):
-        counts = {
-            "pad": 0,
-            "hospital": 0,
-            "charging_hub": 0,
-        }
-
+        counts = {"pad": 0, "hospital": 0, "charging_hub": 0}
         full_nodes = 0
         busy_nodes = 0
         available_nodes = 0
         total_aircraft_on_routes = 0
+        closed_corridors = 0
+        restricted_corridors = 0
 
         for node in self.nodes.values():
             counts[node.node_type] = counts.get(node.node_type, 0) + 1
@@ -803,6 +789,11 @@ class MunichAirspaceDigitalTwin:
         for route in self.routes:
             total_aircraft_on_routes += route.current_aircraft_count
 
+            if route.safety_status == "closed":
+                closed_corridors += 1
+            elif route.safety_status == "restricted":
+                restricted_corridors += 1
+
         return {
             "total_nodes": len(self.nodes),
             "total_routes": len(self.routes),
@@ -813,6 +804,9 @@ class MunichAirspaceDigitalTwin:
             "busy_nodes": busy_nodes,
             "full_nodes": full_nodes,
             "total_aircraft_on_routes": total_aircraft_on_routes,
+            "closed_corridors": closed_corridors,
+            "restricted_corridors": restricted_corridors,
+            "event_count": len(self.event_log),
         }
 
     def _get_marker_color(self, node):
@@ -874,7 +868,7 @@ class MunichAirspaceDigitalTwin:
         </div>
         """
 
-    def _get_hover_tooltip_html(self, node):
+    def _get_node_tooltip_html(self, node):
         status_color = {
             "available": "#16a34a",
             "busy": "#f97316",
@@ -882,15 +876,10 @@ class MunichAirspaceDigitalTwin:
         }.get(node.availability_status, "#6b7280")
 
         return f"""
-        <div style="
-            font-family: Arial, sans-serif;
-            font-size: 13px;
-            min-width: 240px;
-        ">
+        <div style="font-family: Arial, sans-serif; font-size: 13px; min-width: 240px;">
             <div style="font-size: 15px; font-weight: 800; margin-bottom: 4px;">
                 {node.name}
             </div>
-
             <div><b>Type:</b> {node.node_type}</div>
             <div><b>Capacity:</b> {node.capacity}</div>
             <div><b>Current load:</b> {node.current_load}</div>
@@ -901,9 +890,7 @@ class MunichAirspaceDigitalTwin:
                     {node.availability_status.upper()}
                 </span>
             </div>
-
             <hr style="margin: 6px 0;">
-
             <div><b>Priority:</b> {node.priority_level}</div>
             <div><b>Demand:</b> {node.demand_score}</div>
             <div><b>Zone:</b> {node.zone_type}</div>
@@ -919,10 +906,7 @@ class MunichAirspaceDigitalTwin:
         output_path = Path(filename)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        munich_bounds = [
-            [48.06, 11.42],
-            [48.38, 11.82],
-        ]
+        munich_bounds = [[48.06, 11.42], [48.38, 11.82]]
 
         munich_map = folium.Map(
             location=[48.17, 11.62],
@@ -934,23 +918,9 @@ class MunichAirspaceDigitalTwin:
             control_scale=True,
         )
 
-        folium.TileLayer(
-            tiles="OpenStreetMap",
-            name="OpenStreetMap",
-            control=True,
-        ).add_to(munich_map)
-
-        folium.TileLayer(
-            tiles="CartoDB positron",
-            name="Light map",
-            control=True,
-        ).add_to(munich_map)
-
-        folium.TileLayer(
-            tiles="CartoDB dark_matter",
-            name="Dark map",
-            control=True,
-        ).add_to(munich_map)
+        folium.TileLayer("OpenStreetMap", name="OpenStreetMap", control=True).add_to(munich_map)
+        folium.TileLayer("CartoDB positron", name="Light map", control=True).add_to(munich_map)
+        folium.TileLayer("CartoDB dark_matter", name="Dark map", control=True).add_to(munich_map)
 
         munich_map.fit_bounds(munich_bounds)
         munich_map.add_child(RestrictMapBounds(munich_bounds))
@@ -963,8 +933,8 @@ class MunichAirspaceDigitalTwin:
         city_routes_group = folium.FeatureGroup(name="City Corridors", show=True)
         medical_routes_group = folium.FeatureGroup(name="Medical Corridors", show=True)
         charging_routes_group = folium.FeatureGroup(name="Charging Corridors", show=True)
-        labels_group = folium.FeatureGroup(name="Location Labels", show=True)
-        highlighted_path_group = folium.FeatureGroup(name="Highlighted Lowest-Cost Path", show=True)
+        labels_group = folium.FeatureGroup(name="Location Labels", show=False)
+        highlighted_path_group = folium.FeatureGroup(name="Highlighted Best Route", show=True)
 
         route_style = {
             "airport_corridor": {"color": "#6366f1", "weight": 5, "dash_array": None},
@@ -989,40 +959,46 @@ class MunichAirspaceDigitalTwin:
                 {"color": "#555555", "weight": 3, "dash_array": None},
             )
 
+            opacity = 0.85
+            if route.safety_status == "closed":
+                opacity = 0.25
+            elif route.safety_status == "restricted":
+                opacity = 0.55
+
             route_weight = style["weight"] + min(route.current_aircraft_count, 5) * 0.4
 
             route_popup = f"""
-            <div style="font-family: Arial; width: 300px;">
-                <h4 style="margin-bottom: 6px;">Air Corridor</h4>
+            <div style="font-family: Arial; width: 330px;">
+                <h4 style="margin-bottom: 6px;">Fixed Air Corridor</h4>
                 <b>From:</b> {route.start}<br>
                 <b>To:</b> {route.end}<br>
                 <b>Type:</b> {route.route_type}<br>
+                <b>Altitude layer:</b> {route.altitude_layer}<br>
+                <b>Safety status:</b> {route.safety_status}<br>
                 <b>Distance:</b> {route.distance} km<br>
-                <b>Battery rate:</b> {BATTERY_CONSUMPTION_RATE}<br>
                 <b>Battery cost:</b> {route.battery_cost}<br>
                 <b>Noise penalty:</b> {route.noise_penalty}<br>
                 <b>Weather penalty:</b> {route.weather_penalty}<br>
-                <b>Aircraft on route:</b> {route.current_aircraft_count}<br>
+                <b>Aircraft count:</b> {route.current_aircraft_count}<br>
                 <b>Traffic penalty:</b> {route.traffic_penalty}<br>
-                <b>Total cost:</b> {route.total_cost}
+                <b>Passenger cost:</b> {route.mission_cost("passenger")}<br>
+                <b>Medical cost:</b> {route.mission_cost("medical")}<br>
+                <b>Organ cost:</b> {route.mission_cost("organ")}<br>
             </div>
             """
 
             folium.PolyLine(
-                locations=[
-                    [start_node.lat, start_node.lon],
-                    [end_node.lat, end_node.lon],
-                ],
+                locations=[[start_node.lat, start_node.lon], [end_node.lat, end_node.lon]],
                 color=style["color"],
                 weight=route_weight,
-                opacity=0.85,
+                opacity=opacity,
                 dash_array=style["dash_array"],
                 tooltip=(
                     f"{route.start} ↔ {route.end} | "
-                    f"aircraft {route.current_aircraft_count} | "
-                    f"cost {route.total_cost}"
+                    f"{route.altitude_layer} | {route.safety_status} | "
+                    f"aircraft={route.current_aircraft_count}"
                 ),
-                popup=folium.Popup(route_popup, max_width=340),
+                popup=folium.Popup(route_popup, max_width=360),
             ).add_to(route_group_by_type[route.route_type])
 
         if highlight_path and len(highlight_path) >= 2:
@@ -1032,14 +1008,11 @@ class MunichAirspaceDigitalTwin:
                     end_node = self.nodes[end]
 
                     folium.PolyLine(
-                        locations=[
-                            [start_node.lat, start_node.lon],
-                            [end_node.lat, end_node.lon],
-                        ],
+                        locations=[[start_node.lat, start_node.lon], [end_node.lat, end_node.lon]],
                         color="#facc15",
-                        weight=8,
+                        weight=9,
                         opacity=0.95,
-                        tooltip=f"Highlighted path: {start} → {end}",
+                        tooltip=f"Highlighted best route: {start} → {end}",
                     ).add_to(highlighted_path_group)
 
         for node in self.nodes.values():
@@ -1064,7 +1037,7 @@ class MunichAirspaceDigitalTwin:
             marker = folium.Marker(
                 location=[node.lat, node.lon],
                 tooltip=folium.Tooltip(
-                    self._get_hover_tooltip_html(node),
+                    self._get_node_tooltip_html(node),
                     sticky=True,
                     direction="top",
                     opacity=0.95,
@@ -1088,7 +1061,7 @@ class MunichAirspaceDigitalTwin:
                 location=[node.lat + 0.002, node.lon + 0.002],
                 icon=folium.DivIcon(
                     html=self._get_label_html(node),
-                    icon_size=(220, 20),
+                    icon_size=(240, 20),
                     icon_anchor=(0, 0),
                 ),
             ).add_to(labels_group)
@@ -1098,30 +1071,17 @@ class MunichAirspaceDigitalTwin:
         medical_routes_group.add_to(munich_map)
         charging_routes_group.add_to(munich_map)
         highlighted_path_group.add_to(munich_map)
-
         pads_group.add_to(munich_map)
         hospitals_group.add_to(munich_map)
         charging_group.add_to(munich_map)
         labels_group.add_to(munich_map)
 
-        Fullscreen(
-            position="topright",
-            title="Full screen",
-            title_cancel="Exit full screen",
-            force_separate_button=True,
-        ).add_to(munich_map)
-
-        MiniMap(
-            toggle_display=True,
-            minimized=True,
-            position="bottomright",
-        ).add_to(munich_map)
-
+        Fullscreen(position="topright", force_separate_button=True).add_to(munich_map)
+        MiniMap(toggle_display=True, minimized=True, position="bottomright").add_to(munich_map)
         MeasureControl(
             position="topleft",
             primary_length_unit="kilometers",
             secondary_length_unit="meters",
-            primary_area_unit="sqmeters",
         ).add_to(munich_map)
 
         folium.LayerControl(collapsed=False).add_to(munich_map)
@@ -1134,7 +1094,7 @@ class MunichAirspaceDigitalTwin:
             top: 20px;
             left: 50px;
             z-index: 9999;
-            width: 360px;
+            width: 370px;
             background: rgba(255,255,255,0.96);
             padding: 16px;
             border-radius: 14px;
@@ -1147,29 +1107,12 @@ class MunichAirspaceDigitalTwin:
                 Munich Airspace Digital Twin
             </div>
             <div style="font-size: 12px; color: #4b5563; margin-bottom: 12px;">
-                Phase 1.5: pad availability + route congestion
+                Fixed corridors + dynamic mission-specific routing
             </div>
 
             <div style="
                 display: grid;
                 grid-template-columns: 1fr 1fr 1fr;
-                gap: 8px;
-                margin-bottom: 12px;
-            ">
-                <div style="background:#dcfce7; padding:8px; border-radius:8px;">
-                    <b>{stats["available_nodes"]}</b><br><span style="font-size:12px;">Available</span>
-                </div>
-                <div style="background:#ffedd5; padding:8px; border-radius:8px;">
-                    <b>{stats["busy_nodes"]}</b><br><span style="font-size:12px;">Busy</span>
-                </div>
-                <div style="background:#fee2e2; padding:8px; border-radius:8px;">
-                    <b>{stats["full_nodes"]}</b><br><span style="font-size:12px;">Full</span>
-                </div>
-            </div>
-
-            <div style="
-                display: grid;
-                grid-template-columns: 1fr 1fr;
                 gap: 8px;
                 margin-bottom: 12px;
             ">
@@ -1180,65 +1123,38 @@ class MunichAirspaceDigitalTwin:
                     <b>{stats["hospitals"]}</b><br><span style="font-size:12px;">Hospitals</span>
                 </div>
                 <div style="background:#f0fdf4; padding:8px; border-radius:8px;">
-                    <b>{stats["charging_hubs"]}</b><br><span style="font-size:12px;">Charging Hubs</span>
+                    <b>{stats["charging_hubs"]}</b><br><span style="font-size:12px;">Charging</span>
                 </div>
                 <div style="background:#f9fafb; padding:8px; border-radius:8px;">
-                    <b>{stats["total_aircraft_on_routes"]}</b><br><span style="font-size:12px;">Aircraft on Routes</span>
+                    <b>{stats["total_routes"]}</b><br><span style="font-size:12px;">Corridors</span>
+                </div>
+                <div style="background:#fff7ed; padding:8px; border-radius:8px;">
+                    <b>{stats["total_aircraft_on_routes"]}</b><br><span style="font-size:12px;">Aircraft</span>
+                </div>
+                <div style="background:#fee2e2; padding:8px; border-radius:8px;">
+                    <b>{stats["closed_corridors"]}</b><br><span style="font-size:12px;">Closed</span>
                 </div>
             </div>
 
             <div style="font-size: 13px; line-height: 1.55;">
-                <b>Cost formula</b><br>
-                distance + battery + noise + weather + traffic<br><br>
+                <b>Core idea</b><br>
+                Fixed corridors stay in place. Their cost changes dynamically.<br><br>
 
-                <b>Battery</b><br>
-                battery cost = distance × {BATTERY_CONSUMPTION_RATE}<br><br>
+                <b>Mission behavior</b><br>
+                Passenger: distance + battery + noise + weather + traffic<br>
+                Medical: distance + battery + weather + low traffic weight<br>
+                Organ: distance + weather only<br>
+                Low battery: nearest charger-oriented route<br><br>
 
-                <b>Traffic</b><br>
-                traffic penalty = aircraft count × {TRAFFIC_PENALTY_PER_AIRCRAFT}<br><br>
-
-                <b>Marker colors</b><br>
-                <span style="color:#1f78b4; font-weight:bold;">●</span> Available pad<br>
-                <span style="color:#f97316; font-weight:bold;">●</span> Busy / low slots<br>
-                <span style="color:#7f1d1d; font-weight:bold;">●</span> Full / no slots<br>
-                <span style="color:#e31a1c; font-weight:bold;">●</span> Hospital<br>
-                <span style="color:#33a02c; font-weight:bold;">●</span> Charging hub<br>
-            </div>
-
-            <div style="
-                margin-top: 12px;
-                padding-top: 10px;
-                border-top: 1px solid #e5e7eb;
-                font-size: 12px;
-                color: #4b5563;
-            ">
-                Hover over markers for pad availability.
-                Hover over corridors for congestion and cost.
+                <b>Altitude layers</b><br>
+                Emergency: medical / organ / critical battery<br>
+                Standard: passenger traffic<br>
+                Transit: airport / long-distance routes
             </div>
         </div>
         """
 
         munich_map.get_root().html.add_child(folium.Element(sidebar_html))
-
-        title_html = """
-        <div style="
-            position: fixed;
-            top: 20px;
-            right: 70px;
-            z-index: 9999;
-            background: rgba(17,24,39,0.90);
-            color: white;
-            padding: 10px 14px;
-            border-radius: 10px;
-            font-family: Arial, sans-serif;
-            font-size: 13px;
-            box-shadow: 0 4px 14px rgba(0,0,0,0.25);
-        ">
-            <b>Layer 3:</b> Shared Munich airspace environment
-        </div>
-        """
-
-        munich_map.get_root().html.add_child(folium.Element(title_html))
 
         munich_map.save(output_path)
         return str(output_path)
