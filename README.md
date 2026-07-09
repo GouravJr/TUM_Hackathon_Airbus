@@ -2,9 +2,12 @@
 
 Hackathon prototype for graph-based eVTOL routing in Munich-inspired airspace.
 
-The project provides a static Munich-inspired airspace graph plus small,
-explainable eVTOL simulation demos. The demos are intentionally deterministic
-and use simulated live traffic/noise rather than external data feeds.
+A deterministic simulation and digital-twin platform modeling a 30-aircraft 
+eVTOL fleet (autonomous pad-to-pad transits + hospital medical transfers) 
+operating over a Munich-inspired airspace graph. Includes dynamic corridor 
+congestion, weather rerouting, battery-based emergency diversion logic, 
+hospital dispatch prioritization, and a React dashboard consuming live 
+simulation data from a FastAPI backend.
 
 ## Setup
 
